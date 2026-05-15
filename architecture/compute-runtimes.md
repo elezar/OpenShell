@@ -16,6 +16,10 @@ Each runtime receives a sandbox spec from the gateway and is responsible for:
 - Reporting lifecycle and platform events back to the gateway.
 - Cleaning up runtime-owned resources.
 
+The capability RPC reports driver identity, version, and the default sandbox
+image used by the gateway. GPU availability stays driver-local and is validated
+when a sandbox create request asks for GPU resources.
+
 ## Runtime Summary
 
 | Runtime | Best fit | Sandbox boundary | Notes |

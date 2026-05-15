@@ -312,17 +312,10 @@ impl VmDriver {
 
     #[must_use]
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
-        let gpu_count = self
-            .gpu_inventory
-            .as_ref()
-            .and_then(|inv| inv.lock().ok())
-            .map_or(0, |inv| inv.gpu_count());
         GetCapabilitiesResponse {
             driver_name: DRIVER_NAME.to_string(),
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
-            supports_gpu: self.gpu_inventory.is_some(),
-            gpu_count,
         }
     }
 
@@ -1522,25 +1515,23 @@ fn parse_registry_reference(image_ref: &str) -> Result<Reference, Status> {
 /// `DOCKER_HOST`). If Docker is unavailable, falls back to the Podman
 /// socket, which exposes a Docker-compatible API.
 async fn connect_local_container_engine() -> Option<Docker> {
-    if let Ok(docker) = Docker::connect_with_local_defaults() {
-        if docker.ping().await.is_ok() {
-            return Some(docker);
-        }
+    if let Ok(docker) = Docker::connect_with_local_defaults()
+        && docker.ping().await.is_ok()
+    {
+        return Some(docker);
     }
 
     let podman_socket = podman_socket_path();
-    if podman_socket.exists() {
-        if let Ok(docker) =
+    if podman_socket.exists()
+        && let Ok(docker) =
             Docker::connect_with_unix(podman_socket.to_str()?, 120, bollard::API_DEFAULT_VERSION)
-        {
-            if docker.ping().await.is_ok() {
-                info!(
-                    socket = %podman_socket.display(),
-                    "vm driver: connected to Podman (Docker-compatible API)"
-                );
-                return Some(docker);
-            }
-        }
+        && docker.ping().await.is_ok()
+    {
+        info!(
+            socket = %podman_socket.display(),
+            "vm driver: connected to Podman (Docker-compatible API)"
+        );
+        return Some(docker);
     }
 
     None
