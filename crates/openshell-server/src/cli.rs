@@ -109,15 +109,15 @@ struct RunArgs {
         value_delimiter = ',',
         value_parser = parse_compute_driver
     )]
-    drivers: Vec<ComputeDriverKind>,
+    drivers: Vec<String>,
 
-    /// Path to a Unix domain socket served by an out-of-tree compute driver
+    /// Path to a Unix domain socket served by a remote compute driver
     /// implementing `compute_driver.proto`.
     ///
-    /// When set, the gateway dispatches sandbox lifecycle to that driver
-    /// instead of one of the in-tree backends, skipping both the `--drivers`
-    /// list and the auto-detection probe. The driver name advertised in
-    /// `GetCapabilities` is logged for diagnostics.
+    /// When set, the socket is associated with the single configured driver
+    /// name. If no driver name is configured, the gateway uses `extension`.
+    /// Reserved built-in driver names such as Docker, Podman, Kubernetes, and
+    /// VM do not accept socket endpoints.
     #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
     compute_driver_socket: Option<PathBuf>,
 
@@ -245,6 +245,7 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
     if let Some(file) = file.as_ref() {
         merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
     }
+    normalize_compute_driver_socket_args(&mut args)?;
 
     let local_tls = apply_runtime_defaults(&mut args)?;
     let local_jwt = defaults::complete_local_jwt_config()?;
@@ -375,13 +376,19 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
             args.grpc_rate_limit_requests,
             args.grpc_rate_limit_window_seconds,
         )
-        .with_external_compute_driver_socket(args.compute_driver_socket.clone())
         .with_server_sans(args.server_sans.clone())
         .with_loopback_service_http(args.enable_loopback_service_http);
     validate_grpc_rate_limit_args(
         args.grpc_rate_limit_requests,
         args.grpc_rate_limit_window_seconds,
     )?;
+    if let Some(socket) = args.compute_driver_socket.clone() {
+        let driver = args
+            .drivers
+            .first()
+            .expect("normalize_compute_driver_socket_args sets a driver for socket endpoints");
+        config = config.with_compute_driver_endpoint(driver.clone(), socket);
+    }
 
     if let Some(ttl) = file
         .as_ref()
@@ -468,8 +475,8 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
     .into_diagnostic()
 }
 
-fn parse_compute_driver(value: &str) -> std::result::Result<ComputeDriverKind, String> {
-    value.parse()
+fn parse_compute_driver(value: &str) -> std::result::Result<String, String> {
+    openshell_core::config::normalize_compute_driver_name(value)
 }
 
 fn resolve_config_path(args: &RunArgs) -> Result<Option<PathBuf>> {
@@ -668,16 +675,51 @@ fn validate_grpc_rate_limit_args(requests: Option<u64>, window_seconds: Option<u
     Ok(())
 }
 
-fn effective_single_driver(args: &RunArgs) -> Option<ComputeDriverKind> {
-    // An external-driver socket pins dispatch to the out-of-tree path and
-    // bypasses both the `--drivers` list and auto-detection probe; callers
-    // that key off the in-tree `ComputeDriverKind` get `None` here.
-    if args.compute_driver_socket.is_some() {
-        return None;
+fn normalize_compute_driver_socket_args(args: &mut RunArgs) -> Result<()> {
+    let Some(socket) = args.compute_driver_socket.as_ref() else {
+        return Ok(());
+    };
+    if socket.as_os_str().is_empty() {
+        return Err(miette::miette!(
+            "--compute-driver-socket must not be an empty path"
+        ));
     }
+
+    match args.drivers.as_slice() {
+        [] => {
+            args.drivers.push("extension".to_string());
+            Ok(())
+        }
+        [driver] => {
+            let driver = openshell_core::config::normalize_compute_driver_name(driver)
+                .map_err(|err| miette::miette!("{err}"))?;
+            if matches!(
+                driver.parse::<ComputeDriverKind>().ok(),
+                Some(
+                    ComputeDriverKind::Docker
+                        | ComputeDriverKind::Podman
+                        | ComputeDriverKind::Kubernetes
+                        | ComputeDriverKind::Vm
+                )
+            ) {
+                return Err(miette::miette!(
+                    "--compute-driver-socket cannot be combined with reserved built-in compute driver '{driver}'"
+                ));
+            }
+            args.drivers[0] = driver;
+            Ok(())
+        }
+        drivers => Err(miette::miette!(
+            "--compute-driver-socket requires exactly one compute driver name, got: {}",
+            drivers.join(",")
+        )),
+    }
+}
+
+fn effective_single_driver(args: &RunArgs) -> Option<ComputeDriverKind> {
     match args.drivers.as_slice() {
         [] => openshell_core::config::detect_driver(),
-        [driver] => Some(*driver),
+        [driver] => driver.parse().ok(),
         _ => None,
     }
 }
@@ -1585,41 +1627,67 @@ ssh_session_ttl_secs = 1234
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _g = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER_SOCKET");
 
-        let (args, _) = parse_with_args(&[
+        let (mut args, _) = parse_with_args(&[
             "openshell-gateway",
             "--db-url",
             "sqlite::memory:",
             "--compute-driver-socket",
-            "/run/openshell/external.sock",
+            "/run/openshell/extension.sock",
         ]);
+        super::normalize_compute_driver_socket_args(&mut args).unwrap();
         assert_eq!(
             args.compute_driver_socket.as_deref(),
-            Some(std::path::Path::new("/run/openshell/external.sock"))
+            Some(std::path::Path::new("/run/openshell/extension.sock"))
         );
-        // External socket pins dispatch off the in-tree enum, so the
-        // single-driver helper must return None even when no --drivers given.
+        assert_eq!(args.drivers, ["extension"]);
         assert!(super::effective_single_driver(&args).is_none());
     }
 
     #[test]
-    fn compute_driver_socket_overrides_drivers_flag() {
+    fn compute_driver_socket_rejects_reserved_builtin_drivers() {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _g = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER_SOCKET");
 
-        let (args, _) = parse_with_args(&[
+        let (mut args, _) = parse_with_args(&[
             "openshell-gateway",
             "--db-url",
             "sqlite::memory:",
             "--drivers",
             "docker",
             "--compute-driver-socket",
-            "/run/openshell/external.sock",
+            "/run/openshell/extension.sock",
         ]);
+        let err = super::normalize_compute_driver_socket_args(&mut args).unwrap_err();
         assert!(
-            super::effective_single_driver(&args).is_none(),
-            "external socket must short-circuit --drivers"
+            err.to_string()
+                .contains("cannot be combined with reserved built-in compute driver 'docker'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn compute_driver_socket_rejects_vm_endpoint() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER_SOCKET");
+
+        let (mut args, _) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--drivers",
+            "vm",
+            "--compute-driver-socket",
+            "/run/openshell/vm.sock",
+        ]);
+        let err = super::normalize_compute_driver_socket_args(&mut args).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot be combined with reserved built-in compute driver 'vm'"),
+            "unexpected error: {err}"
         );
     }
 
@@ -1630,14 +1698,16 @@ ssh_session_ttl_secs = 1234
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _g = EnvVarGuard::set(
             "OPENSHELL_COMPUTE_DRIVER_SOCKET",
-            "/var/run/openshell/external.sock",
+            "/var/run/openshell/extension.sock",
         );
 
-        let (args, _) = parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        let (mut args, _) = parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        super::normalize_compute_driver_socket_args(&mut args).unwrap();
         assert_eq!(
             args.compute_driver_socket.as_deref(),
-            Some(std::path::Path::new("/var/run/openshell/external.sock"))
+            Some(std::path::Path::new("/var/run/openshell/extension.sock"))
         );
+        assert_eq!(args.drivers, ["extension"]);
     }
 
     #[test]
